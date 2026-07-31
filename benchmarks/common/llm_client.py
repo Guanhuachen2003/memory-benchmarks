@@ -68,6 +68,29 @@ class LLMClient:
         else:
             self._init_openai(api_key, base_url, timeout, **kwargs)
 
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> dict[str, int] | None:
+        if not usage:
+            return None
+
+        def _get(name: str) -> int:
+            value = getattr(usage, name, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(name)
+            return int(value or 0)
+
+        prompt_tokens = _get("prompt_tokens") or _get("input_tokens")
+        completion_tokens = _get("completion_tokens") or _get("output_tokens")
+        total_tokens = _get("total_tokens") or (prompt_tokens + completion_tokens)
+
+        if total_tokens <= 0:
+            return None
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
     def _openai_chat_token_limit_kwargs(self, max_tokens: int) -> dict[str, Any]:
         """Chat Completions: gpt-5 / o-series reject ``max_tokens``; use ``max_completion_tokens``."""
         m = self.model.lower()
@@ -151,11 +174,28 @@ class LLMClient:
         Returns:
             Generated text string.
         """
+        content, _usage = await self.generate_with_usage(system, user, temperature, max_tokens)
+        return content
+
+    async def generate_with_usage(
+        self,
+        system: str,
+        user: str,
+        temperature: float = 0,
+        max_tokens: int = 4096,
+    ) -> tuple[str, dict[str, int] | None]:
+        """Generate text and return provider token usage when available."""
         if self.provider == "anthropic":
             return await self._generate_anthropic(system, user, temperature, max_tokens)
         return await self._generate_openai(system, user, temperature, max_tokens)
 
-    async def _generate_openai(self, system: str, user: str, temperature: float, max_tokens: int) -> str:
+    async def _generate_openai(
+        self,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[str, dict[str, int] | None]:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -182,17 +222,23 @@ class LLMClient:
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(2 * (attempt + 1))
                         continue
-                    return ""
-                return content.strip()
+                    return "", self._usage_to_dict(resp.usage)
+                return content.strip(), self._usage_to_dict(resp.usage)
             except asyncio.TimeoutError:
                 logger.warning("Generation attempt %d/%d timed out", attempt + 1, self.max_retries)
             except Exception as exc:
                 logger.warning("Generation attempt %d/%d failed: %s", attempt + 1, self.max_retries, exc)
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2 * (attempt + 1))
-        return ""
+        return "", None
 
-    async def _generate_anthropic(self, system: str, user: str, temperature: float, max_tokens: int) -> str:
+    async def _generate_anthropic(
+        self,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[str, dict[str, int] | None]:
         for attempt in range(self.max_retries):
             try:
                 async with self.limiter:
@@ -209,14 +255,14 @@ class LLMClient:
                         timeout=self.timeout,
                     )
                 content = resp.content[0].text if resp.content else ""
-                return content.strip()
+                return content.strip(), self._usage_to_dict(resp.usage)
             except asyncio.TimeoutError:
                 logger.warning("Anthropic generation attempt %d/%d timed out", attempt + 1, self.max_retries)
             except Exception as exc:
                 logger.warning("Anthropic generation attempt %d/%d failed: %s", attempt + 1, self.max_retries, exc)
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2 * (attempt + 1))
-        return ""
+        return "", None
 
     # -------------------------------------------------------------------------
     # Structured output
@@ -245,6 +291,20 @@ class LLMClient:
         Returns:
             Parsed dict or Pydantic model instance.
         """
+        parsed, _usage = await self.generate_structured_with_usage(
+            system, user, response_format, temperature, max_tokens,
+        )
+        return parsed
+
+    async def generate_structured_with_usage(
+        self,
+        system: str,
+        user: str,
+        response_format: type[T] | None = None,
+        temperature: float = 0,
+        max_tokens: int = 4096,
+    ) -> tuple[Any, dict[str, int] | None]:
+        """Generate structured output and return provider token usage when available."""
         if self.provider == "anthropic":
             return await self._generate_structured_anthropic(system, user, response_format, temperature, max_tokens)
         return await self._generate_structured_openai(system, user, response_format, temperature, max_tokens)
@@ -256,7 +316,7 @@ class LLMClient:
         response_format: type[T] | None,
         temperature: float,
         max_tokens: int,
-    ) -> Any:
+    ) -> tuple[Any, dict[str, int] | None]:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -280,7 +340,7 @@ class LLMClient:
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(2 * (attempt + 1))
                         continue
-                    return {}
+                    return {}, self._usage_to_dict(resp.usage)
 
                 parsed = json.loads(raw.strip())
 
@@ -293,8 +353,8 @@ class LLMClient:
                         parsed = inner
 
                 if response_format is not None:
-                    return response_format(**parsed)
-                return parsed
+                    return response_format(**parsed), self._usage_to_dict(resp.usage)
+                return parsed, self._usage_to_dict(resp.usage)
 
             except (json.JSONDecodeError, ValueError) as exc:
                 logger.warning("Structured output parse error attempt %d/%d: %s", attempt + 1, self.max_retries, exc)
@@ -305,7 +365,7 @@ class LLMClient:
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2 * (attempt + 1))
 
-        return {} if response_format is None else None
+        return ({} if response_format is None else None), None
 
     async def _generate_structured_anthropic(
         self,
@@ -314,7 +374,7 @@ class LLMClient:
         response_format: type[T] | None,
         temperature: float,
         max_tokens: int,
-    ) -> Any:
+    ) -> tuple[Any, dict[str, int] | None]:
         # Anthropic doesn't have native JSON mode; instruct in system prompt
         json_system = system
         if "json" not in system.lower():
@@ -345,8 +405,8 @@ class LLMClient:
 
                 parsed = json.loads(raw)
                 if response_format is not None:
-                    return response_format(**parsed)
-                return parsed
+                    return response_format(**parsed), self._usage_to_dict(resp.usage)
+                return parsed, self._usage_to_dict(resp.usage)
 
             except (json.JSONDecodeError, ValueError) as exc:
                 logger.warning("Anthropic structured parse error attempt %d/%d: %s", attempt + 1, self.max_retries, exc)
@@ -357,7 +417,7 @@ class LLMClient:
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2 * (attempt + 1))
 
-        return {} if response_format is None else None
+        return ({} if response_format is None else None), None
 
     # -------------------------------------------------------------------------
     # Yes/No judge shortcut
@@ -365,5 +425,10 @@ class LLMClient:
 
     async def judge_yes_no(self, prompt: str) -> tuple[bool, str]:
         """Run a yes/no judge prompt. Returns (correct, raw_response)."""
-        raw = await self.generate(system="", user=prompt, temperature=0)
-        return self._parse_yes_no_judgment(raw), raw
+        correct, raw, _usage = await self.judge_yes_no_with_usage(prompt)
+        return correct, raw
+
+    async def judge_yes_no_with_usage(self, prompt: str) -> tuple[bool, str, dict[str, int] | None]:
+        """Run a yes/no judge prompt and return provider token usage when available."""
+        raw, usage = await self.generate_with_usage(system="", user=prompt, temperature=0)
+        return self._parse_yes_no_judgment(raw), raw, usage

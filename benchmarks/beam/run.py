@@ -56,6 +56,13 @@ from benchmarks.common.schema import (
     Metrics,
     UnifiedResult,
 )
+from benchmarks.common.token_usage import (
+    add_usage,
+    display_token_usage_summary,
+    empty_usage,
+    extract_usage,
+    summarize_token_usage,
+)
 from benchmarks.common.utils import (
     Checkpoint,
     GracefulShutdown,
@@ -350,11 +357,11 @@ async def ingest_conversation(
     output_dir: str,
     shutdown: GracefulShutdown,
     debug: bool = True,
-) -> tuple[bool, str, int]:
+) -> tuple[bool, str, int, dict[str, int] | None]:
     """Ingest all batches of a BEAM conversation into Mem0.
 
     Returns:
-        (success, user_id, total_chunks_processed)
+        (success, user_id, total_chunks_processed, token_usage)
     """
     user_id = f"beam_{chat_size}_{conv_idx}_{run_id}"
     chat_data = conversation.get("chat", [])
@@ -375,7 +382,7 @@ async def ingest_conversation(
             user_id,
             chunks_done,
         )
-        return True, user_id, chunks_done
+        return True, user_id, chunks_done, cp_data.get("token_usage")
 
     # Check for partial progress
     chunks_already_done, resumed_uid = checkpoint.load_progress(key, CHUNK_SIZE)
@@ -424,6 +431,7 @@ async def ingest_conversation(
     )
     total_processed = len(chunks_already_done)
     total_failed = 0
+    ingest_token_usage = empty_usage()
 
     for batch_idx, batch_turns in enumerate(batches):
         chunks = batch_to_chunks(batch_turns)
@@ -458,7 +466,8 @@ async def ingest_conversation(
                 pbar.close()
                 if debug_file:
                     debug_file.close()
-                return True, user_id, total_processed
+                final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
+                return True, user_id, total_processed, final_usage
 
             # Skip empty messages
             if any(not msg.get("content", "").strip() for msg in messages):
@@ -476,6 +485,7 @@ async def ingest_conversation(
             response = await mem0.add(messages, user_id, timestamp=time_epoch)
 
             if response is not None:
+                add_usage(ingest_token_usage, extract_usage(response))
                 total_processed += 1
                 if debug_file:
                     results = response.get("results", [])
@@ -521,6 +531,7 @@ async def ingest_conversation(
         )
         debug_file.close()
 
+    final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
     checkpoint.save_complete(
         key,
         {
@@ -532,10 +543,11 @@ async def ingest_conversation(
             "chunk_size": CHUNK_SIZE,
             "total_chunks_processed": total_processed,
             "total_chunks_failed": total_failed,
+            "token_usage": final_usage,
         },
     )
 
-    return total_failed == 0, user_id, total_processed
+    return total_failed == 0, user_id, total_processed, final_usage
 
 
 # ===============================================================================
@@ -736,7 +748,10 @@ async def process_question(
 
         # Generate answer
         gen_prompt = get_beam_answer_generation_prompt(question_text, sliced, top_k=c)
-        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer, answer_usage = await answerer.generate_with_usage(
+            system="",
+            user=gen_prompt,
+        )
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -745,6 +760,7 @@ async def process_question(
                 "judgment": "ERROR",
                 "score": 0.0,
                 "generated_answer": generated_answer,
+                "answer_token_usage": answer_usage,
                 "memories_evaluated": len(sliced),
                 "nugget_scores": [],
                 "error": "No rubric nuggets found",
@@ -772,6 +788,7 @@ async def process_question(
             "judgment": "PASS" if avg_score >= 0.5 else "FAIL",
             "score": round(avg_score, 4),
             "generated_answer": generated_answer,
+            "answer_token_usage": answer_usage,
             "memories_evaluated": len(sliced),
             "nugget_scores": nugget_scores,
         }
@@ -1059,6 +1076,7 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics = compute_beam_metrics(all_evaluations, cutoffs)
             display_results(metrics, cutoffs)
+            display_token_usage_summary(summarize_token_usage(all_evaluations))
         else:
             print("Results don't have cutoff_results. Run without --evaluate-only first.")
         return
@@ -1067,6 +1085,7 @@ async def async_main() -> None:
 
     # Track user_ids: (chat_size, conv_idx) -> user_id
     conv_user_ids: dict[tuple[str, int], str] = {}
+    conv_ingestion: dict[tuple[str, int], tuple[int, dict[str, int] | None]] = {}
 
     async with mem0:
         with shutdown:
@@ -1089,7 +1108,7 @@ async def async_main() -> None:
                     if shutdown.requested:
                         break
 
-                    success, user_id, chunks = await ingest_conversation(
+                    success, user_id, chunks, ingest_usage = await ingest_conversation(
                         chat_size=size,
                         conv_idx=ci,
                         conversation=convs[ci],
@@ -1101,6 +1120,7 @@ async def async_main() -> None:
                         debug=args.debug,
                     )
                     conv_user_ids[(size, ci)] = user_id
+                    conv_ingestion[(size, ci)] = (chunks, ingest_usage)
                     if not success:
                         logger.warning("[%s][%d] Had failures during ingestion", size, ci)
 
@@ -1121,6 +1141,10 @@ async def async_main() -> None:
                         is_done, cp_data = cp.is_complete(f"{size}_{ci}", CHUNK_SIZE)
                         if is_done and cp_data:
                             conv_user_ids[key] = cp_data["user_id"]
+                            conv_ingestion[key] = (
+                                cp_data.get("total_chunks_processed", 0),
+                                cp_data.get("token_usage"),
+                            )
                         else:
                             conv_user_ids[key] = f"beam_{size}_{ci}_{run_id}"
 
@@ -1148,6 +1172,10 @@ async def async_main() -> None:
                 if f"{size}_{ci}_q{qi}_{q.get('question_type', 'unknown')}" in existing_ids
             )
             remaining = len(all_questions) - already_done
+            question_counts: dict[tuple[str, int], int] = {}
+            for _, _, size, ci, _, _ in all_questions:
+                key = (size, ci)
+                question_counts[key] = question_counts.get(key, 0) + 1
 
             print(
                 f"\n=== Processing {len(all_questions)} questions "
@@ -1186,6 +1214,17 @@ async def async_main() -> None:
                         score_debug=args.score_debug,
                         conversation_meta=meta,
                     )
+                    chunks, ingest_usage = conv_ingestion.get((size, ci), (0, None))
+                    question_count = question_counts.get((size, ci), 0)
+                    if ingest_usage and question_count:
+                        result["ingestion"] = {
+                            "items_processed": chunks,
+                            "items_failed": 0,
+                            "token_usage": {
+                                key: round(value / question_count)
+                                for key, value in ingest_usage.items()
+                            },
+                        }
 
                     # Save per-question checkpoint
                     result_path = os.path.join(output_dir, f"{qid}.json")
@@ -1202,6 +1241,8 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics_by_cutoff = compute_beam_metrics(all_evaluations, cutoffs)
             display_results(metrics_by_cutoff, cutoffs)
+            token_usage_summary = summarize_token_usage(all_evaluations)
+            display_token_usage_summary(token_usage_summary)
 
             # Save unified result JSON
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1228,6 +1269,7 @@ async def async_main() -> None:
                         "question_types": q_type_filter or BEAM_QUESTION_TYPES,
                     },
                     "metrics_by_cutoff": metrics_by_cutoff,
+                    "token_usage_summary": token_usage_summary,
                     "evaluations": all_evaluations,
                 },
             )

@@ -64,6 +64,13 @@ from benchmarks.common.schema import (
     RetrievalData,
     UnifiedResult,
 )
+from benchmarks.common.token_usage import (
+    add_usage,
+    display_token_usage_summary,
+    empty_usage,
+    extract_usage,
+    summarize_token_usage,
+)
 from benchmarks.common.utils import (
     Checkpoint,
     GracefulShutdown,
@@ -337,12 +344,12 @@ async def ingest_question(
     output_dir: str,
     shutdown: GracefulShutdown,
     debug: bool = True,
-) -> tuple[bool, str, int]:
+) -> tuple[bool, str, int, dict[str, int] | None]:
     """Ingest all haystack sessions of a LongMemEval question into Mem0.
 
     Each question gets its own user_id so memories don't leak between questions.
 
-    Returns: (success, user_id, total_pairs_processed)
+    Returns: (success, user_id, total_pairs_processed, token_usage)
     """
     question_id = question["question_id"]
     user_id = f"longmemeval_{question_id}_{run_id}"
@@ -359,7 +366,7 @@ async def ingest_question(
             "Question %s already ingested (user_id=%s, %d pairs)",
             question_id, user_id, pairs_done,
         )
-        return True, user_id, pairs_done
+        return True, user_id, pairs_done, cp_data.get("token_usage")
 
     # Check for partial progress
     chunks_already_done, resumed_uid = checkpoint.load_progress(key, CHUNK_SIZE)
@@ -403,6 +410,7 @@ async def ingest_question(
     )
     total_processed = len(chunks_already_done)
     total_failed = 0
+    ingest_token_usage = empty_usage()
 
     for session_idx, (session_id, date_str, session) in enumerate(sorted_sessions):
         if not session:
@@ -433,7 +441,8 @@ async def ingest_question(
                 pbar.close()
                 if debug_file:
                     debug_file.close()
-                return True, user_id, total_processed
+                final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
+                return True, user_id, total_processed, final_usage
 
             # Skip pairs with empty content
             if any(not msg.get("content", "").strip() for msg in messages):
@@ -451,6 +460,7 @@ async def ingest_question(
             response = await mem0.add(messages, user_id, timestamp=session_timestamp)
 
             if response is not None:
+                add_usage(ingest_token_usage, extract_usage(response))
                 total_processed += 1
                 if debug_file:
                     results = response.get("results", [])
@@ -489,6 +499,7 @@ async def ingest_question(
         )
         debug_file.close()
 
+    final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
     checkpoint.save_complete(key, {
         "question_id": question_id,
         "user_id": user_id,
@@ -496,9 +507,10 @@ async def ingest_question(
         "chunk_size": CHUNK_SIZE,
         "total_pairs_processed": total_processed,
         "total_pairs_failed": total_failed,
+        "token_usage": final_usage,
     })
 
-    return total_failed == 0, user_id, total_processed
+    return total_failed == 0, user_id, total_processed, final_usage
 
 
 # ===============================================================================
@@ -590,7 +602,7 @@ async def process_question_answerer(
             question_date=question_date_human,
             user_profile=user_profile,
         )
-        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer, answer_usage = await answerer.generate_with_usage(system="", user=gen_prompt)
 
         # Strip chain-of-thought tags
         generated_answer = re.sub(
@@ -619,6 +631,7 @@ async def process_question_answerer(
             "judgment": judgment,
             "score": score,
             "generated_answer": generated_answer,
+            "answer_token_usage": answer_usage,
             "judge_raw": judge_raw,
             "memories_evaluated": len(sliced),
             "reason": f"Generated answer: {generated_answer[:500]}",
@@ -756,7 +769,7 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
             question_date=question_date_human,
             user_profile=user_profile,
         )
-        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer, answer_usage = await answerer.generate_with_usage(system="", user=gen_prompt)
         generated_answer = re.sub(
             r"[<\[]mem_thinking[>\]].*?[<\[]/mem_thinking[>\]]",
             "",
@@ -782,6 +795,7 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
             "judgment": judgment,
             "score": score,
             "generated_answer": generated_answer,
+            "answer_token_usage": answer_usage,
             "judge_raw": judge_raw,
             "memories_evaluated": len(sliced),
             "reason": f"Generated answer: {generated_answer[:500]}",
@@ -1197,6 +1211,8 @@ async def async_main() -> None:
         ]
         metrics = compute_longmemeval_metrics(all_evaluations, cutoffs)
         display_results(metrics, cutoffs)
+        token_usage_summary = summarize_token_usage(all_evaluations)
+        display_token_usage_summary(token_usage_summary)
 
         run_id_meta = args.run_id or run_id
 
@@ -1224,6 +1240,7 @@ async def async_main() -> None:
                 "evaluate_only": True,
             },
             "metrics_by_cutoff": metrics,
+            "token_usage_summary": token_usage_summary,
             "evaluations": all_evaluations,
         })
         print(f"\nResults saved to: {unified_path}")
@@ -1284,13 +1301,16 @@ async def async_main() -> None:
 
                     # Check if we have predict-only results (search data already exists)
                     existing_predict = predict_only_results.get(question_id)
+                    success = True
+                    pairs = 0
+                    ingest_usage = None
                     if existing_predict and existing_predict.get("retrieval"):
                         # Skip ingest+search, use existing search results
                         user_id = existing_predict.get("user_id", f"longmemeval_{question_id}_{run_id}")
                         user_profile = None
                     else:
                         # --- Ingest ---
-                        success, user_id, pairs = await ingest_question(
+                        success, user_id, pairs, ingest_usage = await ingest_question(
                             question=question,
                             mem0=mem0,
                             logger=logger,
@@ -1308,6 +1328,14 @@ async def async_main() -> None:
                             return
 
                         existing_predict = None  # will search fresh below
+                    if existing_predict and existing_predict.get("ingestion"):
+                        ingest_info = existing_predict.get("ingestion")
+                    else:
+                        ingest_info = {
+                            "items_processed": pairs,
+                            "items_failed": 0 if success else 1,
+                            "token_usage": ingest_usage,
+                        }
 
                     # Fetch user profile if requested
                     user_profile = None
@@ -1348,6 +1376,8 @@ async def async_main() -> None:
                             score_debug=args.score_debug,
                             existing_search_results=existing_search,
                         )
+                    if ingest_info:
+                        result["ingestion"] = ingest_info
 
                     # Save per-question result
                     result_path = os.path.join(output_dir, f"{question_id}.json")
@@ -1373,6 +1403,8 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics = compute_longmemeval_metrics(deduped, cutoffs)
             display_results(metrics, cutoffs)
+            token_usage_summary = summarize_token_usage(deduped)
+            display_token_usage_summary(token_usage_summary)
 
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1398,6 +1430,7 @@ async def async_main() -> None:
                     "seed": args.seed,
                 },
                 "metrics_by_cutoff": metrics,
+                "token_usage_summary": token_usage_summary,
                 "evaluations": all_evaluations,
             })
             print(f"\nResults saved to: {unified_path}")

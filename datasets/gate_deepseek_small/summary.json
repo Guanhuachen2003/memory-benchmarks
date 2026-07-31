@@ -1,0 +1,52 @@
+{
+  "dataset_path": "datasets/longmemeval/longmemeval_s_cleaned.json",
+  "teacher_model": "deepseek-chat",
+  "teacher_base_url": "https://api.deepseek.com",
+  "seed": 20260728,
+  "requested_size": 500,
+  "candidate_count": 2000,
+  "final_count": 500,
+  "label_distribution": {
+    "true": 250,
+    "false": 250
+  },
+  "sampling_bucket_distribution": {
+    "likely_memory": 321,
+    "likely_non_memory": 179
+  },
+  "information_type_distribution": {
+    "profile": 57,
+    "none": 250,
+    "constraint": 17,
+    "plan": 46,
+    "experience": 42,
+    "preference": 60,
+    "state_change": 13,
+    "relationship": 13,
+    "instruction": 2
+  },
+  "operation_type_distribution": {
+    "new": 243,
+    "none": 250,
+    "update": 5,
+    "repeat": 1,
+    "correction": 1
+  },
+  "split_counts": {
+    "train": 390,
+    "test": 64,
+    "validation": 46
+  },
+  "split_conversations": {
+    "train": 246,
+    "test": 38,
+    "validation": 33
+  },
+  "conversation_leakage_count": 0,
+  "teacher_usage": {
+    "prompt_tokens": 1860221,
+    "completion_tokens": 87106,
+    "total_tokens": 1947327,
+    "requests": 250
+  }
+}
