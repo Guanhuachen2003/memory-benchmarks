@@ -55,6 +55,13 @@ from benchmarks.common.schema import (
     RetrievalData,
     UnifiedResult,
 )
+from benchmarks.common.token_usage import (
+    add_usage,
+    display_token_usage_summary,
+    empty_usage,
+    extract_usage,
+    summarize_token_usage,
+)
 from benchmarks.common.utils import (
     Checkpoint,
     GracefulShutdown,
@@ -245,10 +252,10 @@ async def ingest_conversation(
     output_dir: str,
     shutdown: GracefulShutdown,
     debug: bool = True,
-) -> tuple[bool, str, int]:
+) -> tuple[bool, str, int, dict[str, int] | None]:
     """Ingest all sessions of a LOCOMO conversation into Mem0.
 
-    Returns: (success, user_id, total_chunks_processed)
+    Returns: (success, user_id, total_chunks_processed, token_usage)
     """
     conversation = entry["conversation"]
     speaker_a = conversation["speaker_a"]
@@ -264,7 +271,7 @@ async def ingest_conversation(
         chunks_done = cp_data.get("total_chunks_processed", 0)
         user_id = cp_data.get("user_id", user_id)
         logger.info("Conversation %d already ingested (user_id=%s, %d chunks)", conv_idx, user_id, chunks_done)
-        return True, user_id, chunks_done
+        return True, user_id, chunks_done, cp_data.get("token_usage")
 
     # Check for partial progress
     chunks_already_done, resumed_uid = checkpoint.load_progress(key, CHUNK_SIZE)
@@ -298,6 +305,7 @@ async def ingest_conversation(
     pbar = tqdm(total=total_chunks, desc=f"Ingest conv {conv_idx}", initial=len(chunks_already_done), leave=True)
     total_processed = len(chunks_already_done)
     total_failed = 0
+    ingest_token_usage = empty_usage()
 
     for session_key, date_str, turns in sorted_sessions:
         chunks = session_to_chunks(turns, speaker_a, speaker_b)
@@ -322,7 +330,8 @@ async def ingest_conversation(
                 pbar.close()
                 if debug_file:
                     debug_file.close()
-                return True, user_id, total_processed
+                final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
+                return True, user_id, total_processed, final_usage
 
             # Skip empty messages
             if any(not msg.get("content", "").strip() for msg in messages):
@@ -340,6 +349,7 @@ async def ingest_conversation(
             response = await mem0.add(messages, user_id, timestamp=session_epoch)
 
             if response is not None:
+                add_usage(ingest_token_usage, extract_usage(response))
                 total_processed += 1
                 if debug_file:
                     results = response.get("results", [])
@@ -369,6 +379,7 @@ async def ingest_conversation(
         debug_file.write(f"\nSUMMARY: {total_processed}/{total_chunks} OK, {total_failed} failed\n")
         debug_file.close()
 
+    final_usage = ingest_token_usage if ingest_token_usage.get("total_tokens", 0) > 0 else None
     checkpoint.save_complete(key, {
         "conversation_idx": conv_idx,
         "user_id": user_id,
@@ -376,9 +387,10 @@ async def ingest_conversation(
         "chunk_size": CHUNK_SIZE,
         "total_chunks_processed": total_processed,
         "total_chunks_failed": total_failed,
+        "token_usage": final_usage,
     })
 
-    return total_failed == 0, user_id, total_processed
+    return total_failed == 0, user_id, total_processed, final_usage
 
 
 # ===============================================================================
@@ -463,7 +475,7 @@ async def process_question(
 
         # Generate answer
         gen_prompt = get_answer_generation_prompt(question, sliced, reference_date=reference_date_human, user_profile=user_profile)
-        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer, answer_usage = await answerer.generate_with_usage(system="", user=gen_prompt)
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -490,6 +502,7 @@ async def process_question(
             "judgment": judgment,
             "score": score,
             "generated_answer": generated_answer,
+            "answer_token_usage": answer_usage,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
         }
@@ -533,7 +546,7 @@ async def apply_locomo_judge_to_saved_result(
         gen_prompt = get_answer_generation_prompt(
             question, sliced, reference_date=reference_date_human, user_profile=user_profile,
         )
-        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer, answer_usage = await answerer.generate_with_usage(system="", user=gen_prompt)
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -561,6 +574,7 @@ async def apply_locomo_judge_to_saved_result(
             "judgment": judgment,
             "score": score,
             "generated_answer": generated_answer,
+            "answer_token_usage": answer_usage,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
         }
@@ -800,6 +814,8 @@ async def async_main() -> None:
         ]
         metrics = compute_locomo_metrics(all_evaluations, cutoffs)
         display_results(metrics, cutoffs)
+        token_usage_summary = summarize_token_usage(all_evaluations)
+        display_token_usage_summary(token_usage_summary)
 
         run_id_meta = args.run_id or run_id
 
@@ -821,6 +837,7 @@ async def async_main() -> None:
                 "evaluate_only": True,
             },
             "metrics_by_cutoff": metrics,
+            "token_usage_summary": token_usage_summary,
             "evaluations": all_evaluations,
         })
         print(f"\nResults saved to: {unified_path}")
@@ -869,7 +886,7 @@ async def async_main() -> None:
             conversation = entry["conversation"]
 
             # --- Ingest ---
-            success, user_id, chunks = await ingest_conversation(
+            success, user_id, chunks, ingest_usage = await ingest_conversation(
                 conv_idx, entry, mem0, logger, run_id, args.project_name,
                 output_dir, shutdown, debug=args.debug,
             )
@@ -898,6 +915,12 @@ async def async_main() -> None:
             ]
             if args.max_questions is not None:
                 conv_questions = conv_questions[:args.max_questions]
+            ingest_usage_per_question = None
+            if ingest_usage and conv_questions:
+                ingest_usage_per_question = {
+                    key: round(value / len(conv_questions))
+                    for key, value in ingest_usage.items()
+                }
 
             search_pbar = tqdm(conv_questions, desc=f"Questions conv {conv_idx}", leave=True)
             for qi, qa in search_pbar:
@@ -928,6 +951,12 @@ async def async_main() -> None:
                     logger=logger,
                     score_debug=args.score_debug,
                 )
+                if ingest_usage_per_question:
+                    result["ingestion"] = {
+                        "items_processed": chunks,
+                        "items_failed": 0 if success else 1,
+                        "token_usage": ingest_usage_per_question,
+                    }
 
                 # Save per-question result
                 result_path = os.path.join(output_dir, f"{qid}.json")
@@ -947,6 +976,8 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics = compute_locomo_metrics(all_evaluations, cutoffs)
             display_results(metrics, cutoffs)
+            token_usage_summary = summarize_token_usage(all_evaluations)
+            display_token_usage_summary(token_usage_summary)
 
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -966,6 +997,7 @@ async def async_main() -> None:
                     "categories": categories,
                 },
                 "metrics_by_cutoff": metrics,
+                "token_usage_summary": token_usage_summary,
                 "evaluations": all_evaluations,
             })
             print(f"\nResults saved to: {unified_path}")

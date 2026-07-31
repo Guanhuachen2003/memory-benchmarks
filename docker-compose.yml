@@ -9,6 +9,9 @@ services:
         condition: service_healthy
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - MEM0_EMBEDDING_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_EMBEDDING_URL=${OPENROUTER_EMBEDDING_URL:-https://openrouter.ai/api/v1/embeddings}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -21,7 +24,14 @@ services:
       - QDRANT_PORT=6333
       - COLLECTION_NAME=${COLLECTION_NAME:-memories}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-      - EMBEDDER_MODEL=${EMBEDDER_MODEL:-text-embedding-3-small}
+      - EMBEDDER_PROVIDER=${EMBEDDER_PROVIDER:-openrouter}
+      - EMBEDDER_MODEL=${EMBEDDER_MODEL:-openai/text-embedding-3-small}
+      - EMBEDDING_DIMS=${EMBEDDING_DIMS:-1536}
+      - MEMORY_GATE_ENABLED=${MEMORY_GATE_ENABLED:-true}
+      - MEMORY_GATE_FAIL_OPEN=${MEMORY_GATE_FAIL_OPEN:-true}
+      - MEMORY_GATE_MODEL=${MEMORY_GATE_MODEL:-deepseek-chat}
+      - MEMORY_GATE_BASE_URL=${MEMORY_GATE_BASE_URL:-${OPENAI_BASE_URL:-https://api.deepseek.com}}
+      - MEMORY_GATE_API_KEY=${MEMORY_GATE_API_KEY:-${OPENAI_API_KEY}}
     volumes:
       - mem0_history:/app/history
       # Custom config for advanced setups (Azure, Ollama, SageMaker, etc.)

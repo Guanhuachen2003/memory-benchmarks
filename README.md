@@ -122,6 +122,32 @@ All benchmarks accept these common flags:
 
 By default, the Mem0 server uses OpenAI for fact extraction (`gpt-4o-mini`) and embeddings (`text-embedding-3-small`). You can change this by mounting a custom config file.
 
+### Memory-write gate
+
+The local server runs an OpenAI-compatible gate before every `/memories`
+request. Conversations without durable information return an empty `results`
+list and do not call Mem0 `add`. The response includes only the boolean decision
+under `gate.should_add`. Gate tokens are intentionally excluded from benchmark
+token accounting.
+
+```bash
+MEMORY_GATE_ENABLED=true
+MEMORY_GATE_MODEL=deepseek-chat
+MEMORY_GATE_BASE_URL=https://api.deepseek.com
+MEMORY_GATE_API_KEY=your-key
+```
+
+For local vLLM, point the same interface at its OpenAI-compatible endpoint:
+
+```bash
+MEMORY_GATE_MODEL=your-local-model
+MEMORY_GATE_BASE_URL=http://host.docker.internal:8000/v1
+MEMORY_GATE_API_KEY=local-vllm
+```
+
+`MEMORY_GATE_FAIL_OPEN=true` preserves the original add behavior if the gate
+provider is unavailable. Set `MEMORY_GATE_ENABLED=false` to bypass the gate.
+
 **Step 1**: Copy an example config:
 
 ```bash

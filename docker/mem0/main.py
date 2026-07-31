@@ -24,7 +24,9 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query
+from memory_gate import MemoryWriteGate
 from pydantic import BaseModel, Field
+from token_meter import finish_meter, record_usage, start_meter
 
 logger = logging.getLogger("mem0-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -109,9 +111,10 @@ def _load_config() -> dict:
             },
         },
         "embedder": {
-            "provider": os.getenv("EMBEDDER_PROVIDER", "openai"),
+            "provider": os.getenv("EMBEDDER_PROVIDER", "openrouter"),
             "config": {
-                "model": os.getenv("EMBEDDER_MODEL", "text-embedding-3-small"),
+                "model": os.getenv("EMBEDDER_MODEL", "openai/text-embedding-3-small"),
+                "embedding_dims": int(os.getenv("EMBEDDING_DIMS", "1536")),
             },
         },
         "history_db_path": os.getenv("HISTORY_DB_PATH", "/app/history/history.db"),
@@ -128,21 +131,43 @@ from mem0.utils.factory import EmbedderFactory
 
 # Register SageMaker embedder (allowlist patched in Dockerfile via sed)
 EmbedderFactory.provider_to_class["sagemaker"] = "sagemaker_embedder.SageMakerEmbedding"
+EmbedderFactory.provider_to_class["openrouter"] = "openrouter_embedder.OpenRouterEmbedding"
 
 # ---------------------------------------------------------------------------
 # App lifespan — initialise Memory once at startup
 # ---------------------------------------------------------------------------
 
 memory_instance = None
+memory_gate = None
+
+
+def _instrument_llm_usage(mem: Any) -> None:
+    """Capture official usage objects returned by the configured extraction LLM."""
+    completions = getattr(getattr(getattr(mem, "llm", None), "client", None), "chat", None)
+    completions = getattr(completions, "completions", None)
+    if completions is None or not hasattr(completions, "create"):
+        logger.warning("LLM token usage tracking unavailable for the configured provider")
+        return
+
+    original_create = completions.create
+
+    def create_with_usage(*args: Any, **kwargs: Any) -> Any:
+        response = original_create(*args, **kwargs)
+        record_usage("memory_extraction", getattr(response, "usage", None))
+        return response
+
+    completions.create = create_with_usage
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global memory_instance
+    global memory_instance, memory_gate
     from mem0 import Memory
 
     logger.info("Initialising Mem0...")
     memory_instance = Memory.from_config(config)
+    memory_gate = MemoryWriteGate()
+    _instrument_llm_usage(memory_instance)
     logger.info(
         "Mem0 ready (llm=%s, embedder=%s, vector_store=%s)",
         config.get("llm", {}).get("provider", "?"),
@@ -177,6 +202,7 @@ class AddRequest(BaseModel):
     agent_id: str | None = None
     run_id: str | None = None
     metadata: dict[str, Any] | None = None
+    timestamp: int | None = None
     observation_date: str | None = None
     custom_instructions: str | None = None
 
@@ -211,34 +237,63 @@ def add_memories(req: AddRequest):
         params["agent_id"] = req.agent_id
     if req.run_id:
         params["run_id"] = req.run_id
-    if req.metadata:
-        params["metadata"] = req.metadata
+    metadata = dict(req.metadata or {})
+    if req.timestamp is not None:
+        # Mem0 OSS 2.x rejects the SDK's reserved timestamp argument. Keep the
+        # benchmark timestamp queryable without failing the entire add call.
+        metadata.setdefault("timestamp", req.timestamp)
+    if metadata:
+        params["metadata"] = metadata
     # observation_date and custom_instructions: pass through only if
     # the installed mem0ai version supports them
     if req.custom_instructions:
         params["prompt"] = req.custom_instructions
 
+    meter_token = start_meter()
+    gate_decision = None
     try:
-        result = mem.add(req.messages, **params)
-        return result
+        gate_decision = memory_gate.evaluate(req.messages)
+        logger.info(
+            "Memory gate decision: should_add=%s, user_id=%s",
+            gate_decision["should_add"],
+            req.user_id or "-",
+        )
+        if gate_decision["should_add"]:
+            result = mem.add(req.messages, **params)
+        else:
+            result = {"results": []}
     except Exception as e:
         logger.exception("add() failed")
         raise HTTPException(500, str(e))
+    finally:
+        token_usage, token_usage_breakdown = finish_meter(meter_token)
+
+    if isinstance(result, dict):
+        response = dict(result)
+    elif isinstance(result, list):
+        response = {"results": result}
+    else:
+        response = {"results": []}
+    response["token_usage"] = token_usage
+    response["token_usage_breakdown"] = token_usage_breakdown
+    response["gate"] = gate_decision
+    return response
 
 
 @app.post("/search")
 def search_memories(req: SearchRequest):
     """Search memories by semantic similarity + BM25 + entity boost."""
     mem = _get_memory()
-    params: dict[str, Any] = {"limit": req.limit}
+    params: dict[str, Any] = {"top_k": req.limit}
+    filters = dict(req.filters or {})
     if req.user_id:
-        params["user_id"] = req.user_id
+        filters["user_id"] = req.user_id
     if req.agent_id:
-        params["agent_id"] = req.agent_id
+        filters["agent_id"] = req.agent_id
     if req.run_id:
-        params["run_id"] = req.run_id
-    if req.filters:
-        params["filters"] = req.filters
+        filters["run_id"] = req.run_id
+    if filters:
+        params["filters"] = filters
     if req.rerank:
         params["rerank"] = True
 
@@ -258,19 +313,19 @@ def get_memories(
 ):
     """List all memories for a given user/agent/run."""
     mem = _get_memory()
-    params: dict[str, Any] = {}
+    filters: dict[str, Any] = {}
     if user_id:
-        params["user_id"] = user_id
+        filters["user_id"] = user_id
     if agent_id:
-        params["agent_id"] = agent_id
+        filters["agent_id"] = agent_id
     if run_id:
-        params["run_id"] = run_id
+        filters["run_id"] = run_id
 
-    if not params:
+    if not filters:
         raise HTTPException(400, "Provide at least one of: user_id, agent_id, run_id")
 
     try:
-        return mem.get_all(**params)
+        return mem.get_all(filters=filters, top_k=1000)
     except Exception as e:
         logger.exception("get_all() failed")
         raise HTTPException(500, str(e))
@@ -361,6 +416,10 @@ def health():
         "status": "ok",
         "llm": config.get("llm", {}).get("provider", "?"),
         "embedder": config.get("embedder", {}).get("provider", "?"),
+        "memory_gate": {
+            "enabled": bool(memory_gate and memory_gate.enabled),
+            "model": memory_gate.model if memory_gate else None,
+        },
     }
 
 

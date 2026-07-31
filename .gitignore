@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.tools/
 
 # Database
 evals.db
