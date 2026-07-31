@@ -32,6 +32,7 @@ services:
       - MEMORY_GATE_MODEL=${MEMORY_GATE_MODEL:-deepseek-chat}
       - MEMORY_GATE_BASE_URL=${MEMORY_GATE_BASE_URL:-${OPENAI_BASE_URL:-https://api.deepseek.com}}
       - MEMORY_GATE_API_KEY=${MEMORY_GATE_API_KEY:-${OPENAI_API_KEY}}
+      - MEMORY_GATE_PROMPT_FORMAT=${MEMORY_GATE_PROMPT_FORMAT:-json}
     volumes:
       - mem0_history:/app/history
       # Custom config for advanced setups (Azure, Ollama, SageMaker, etc.)

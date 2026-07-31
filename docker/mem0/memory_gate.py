@@ -51,6 +51,7 @@ class MemoryWriteGate:
             or "local-vllm"
         )
         self.system_prompt = os.getenv("MEMORY_GATE_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+        self.prompt_format = os.getenv("MEMORY_GATE_PROMPT_FORMAT", "json").strip().lower()
         self.client = (
             OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=30.0)
             if self.enabled
@@ -77,6 +78,8 @@ class MemoryWriteGate:
     @staticmethod
     def _parse_decision(content: str) -> bool:
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
+        if cleaned.lower() in {"true", "false"}:
+            return cleaned.lower() == "true"
         match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if not match:
             raise ValueError("gate response did not contain a JSON object")
@@ -95,17 +98,27 @@ class MemoryWriteGate:
             return {"should_add": False}
 
         try:
+            if self.prompt_format == "alpaca_boolean":
+                user_prompt = (
+                    "Decide whether this turn should be written to long-term memory.\n\n"
+                    "<recent_context>\n(empty)\n</recent_context>\n\n"
+                    f"<current_turn>\n{conversation}\n</current_turn>"
+                )
+                max_tokens = 8
+                extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            else:
+                user_prompt = f"Evaluate this conversation:\n\n{conversation}"
+                max_tokens = 120
+                extra_body = None
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
-                    {
-                        "role": "user",
-                        "content": f"Evaluate this conversation:\n\n{conversation}",
-                    },
+                    {"role": "user", "content": user_prompt},
                 ],
                 temperature=0,
-                max_tokens=120,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
             )
             content = response.choices[0].message.content or ""
             return {"should_add": self._parse_decision(content)}

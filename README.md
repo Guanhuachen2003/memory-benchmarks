@@ -143,7 +143,12 @@ For local vLLM, point the same interface at its OpenAI-compatible endpoint:
 MEMORY_GATE_MODEL=your-local-model
 MEMORY_GATE_BASE_URL=http://host.docker.internal:8000/v1
 MEMORY_GATE_API_KEY=local-vllm
+MEMORY_GATE_PROMPT_FORMAT=alpaca_boolean
 ```
+
+`alpaca_boolean` matches the fine-tuned gate dataset prompt and accepts the
+model's exact `true`/`false` output. The default `json` format remains compatible
+with the hosted DeepSeek gate.
 
 `MEMORY_GATE_FAIL_OPEN=true` preserves the original add behavior if the gate
 provider is unavailable. Set `MEMORY_GATE_ENABLED=false` to bypass the gate.
