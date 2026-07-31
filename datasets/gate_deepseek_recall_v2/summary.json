@@ -1,0 +1,47 @@
+{
+  "source_dir": "datasets/gate_deepseek_small",
+  "seed": 20260728,
+  "strategy": "all unique train-split positives from 2000 teacher labels; original train negatives; unchanged validation and test",
+  "split_counts": {
+    "train": 495,
+    "validation": 46,
+    "test": 64
+  },
+  "label_distribution": {
+    "train": {
+      "false": 192,
+      "true": 303
+    },
+    "validation": {
+      "false": 22,
+      "true": 24
+    },
+    "test": {
+      "true": 28,
+      "false": 36
+    }
+  },
+  "train_positive_negative_ratio": 1.5781,
+  "train_information_types": {
+    "plan": 59,
+    "constraint": 24,
+    "profile": 64,
+    "experience": 55,
+    "preference": 74,
+    "state_change": 13,
+    "relationship": 14
+  },
+  "train_operation_types": {
+    "new": 295,
+    "correction": 1,
+    "update": 5,
+    "repeat": 2
+  },
+  "conversation_counts": {
+    "train": 271,
+    "validation": 33,
+    "test": 38
+  },
+  "conversation_leakage_count": 0,
+  "unique_id_count": 605
+}
