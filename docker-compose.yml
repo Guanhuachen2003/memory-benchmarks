@@ -4,6 +4,8 @@ services:
       context: ./docker/mem0
     ports:
       - "${MEM0_PORT:-8888}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       qdrant:
         condition: service_healthy
